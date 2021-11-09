@@ -1,11 +1,12 @@
 /*
-    Herbert Yuan <yuanjp@hust.edu.cn>
-    2018/5/27
+ * Herbert Yuan <yuanjp@hust.edu.cn> 2018/5/27
+ * qianfan Zhao <qianfanguijin@163.com> port to am335x platform.
  */
 #include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -37,7 +38,11 @@ static void usage(char *cmd)
 	fprintf(stderr,
 		"<interface>, listen on this interface,\n"
 		"             and use the ip address of this interface \n"
-		"             as the tftp server address\n");
+		"             as the tftp server address\n"
+		"             interface can be ethernet such as eth0\n"
+		"             or a usb network selected by vid:pid,\n"
+		"             will auto set usb network's ip address based on\n"
+		"             -c options, ipv4 address .1 is server ip\n");
 	fprintf(stderr, "-d,          daemon mode\n");
 	fprintf(stderr, "-c ip,       allocate this ip to rpi,\n"
 			"             if you has dhcp server in your LAN ENV,\n"
@@ -79,8 +84,9 @@ static int get_ifhwaddr(char *ifname, unsigned char *mac)
 	return 0;
 }
 
-static int get_ifaddr(char *ifname, struct in_addr *ipv4)
+static int get_set_ifaddr(char *ifname, struct in_addr *ipv4)
 {
+	struct sockaddr_in sai;
 	struct ifreq ifr;
 	int sock;
 
@@ -100,19 +106,63 @@ static int get_ifaddr(char *ifname, struct in_addr *ipv4)
 	}
 
 	if (-1 == ioctl(sock, SIOCGIFADDR, &ifr)) {
-		fprintf(stderr, "ioctl() for %s failed: %s\n", __FUNCTION__,
-			strerror(errno));
-		close(sock);
-		return -1;
+		/* the network interface doesn't has an ip address */
+		if (!ipv4->s_addr) {
+			/* the topper level doesn't set ip address */
+			fprintf(stderr, "network %s doesn't has an ip address\n"
+					"you can use -c option set one\n",
+					ifname);
+			close(sock);
+			return -1;
+		}
+
+		/* set ip address and up interface */
+		memset(&sai, 0, sizeof(sai));
+		sai.sin_family = AF_INET;
+		sai.sin_port = 0;
+		sai.sin_addr.s_addr = ipv4->s_addr;
+		memcpy((char *)&ifr + offsetof(struct ifreq, ifr_addr), &sai,
+			sizeof(struct sockaddr));
+
+		if (-1 == ioctl(sock, SIOCSIFADDR, &ifr)) {
+			fprintf(stderr, "ioctl() SIFADDR for %s failed: %s\n",
+					ifname, strerror(errno));
+			close(sock);
+			return -1;
+		}
+
+		ioctl(sock, SIOCGIFFLAGS, &ifr);
+		ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+		if (-1 == ioctl(sock, SIOCSIFFLAGS, &ifr)) {
+			fprintf(stderr, "ioctl() SIFFLAGS for %s failed: %s\n",
+					ifname, strerror(errno));
+			close(sock);
+			return -1;
+		}
+	} else {
+		struct in_addr ip;
+
+		ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+		if ((ntohl(ip.s_addr) ^ ntohl(ipv4->s_addr)) & 0xffffff00) {
+			/* inet_ntoa is not thread safe, split the message */
+			fprintf(stderr, "-c %s and the ip addr of ",
+					inet_ntoa(*ipv4));
+			fprintf(stderr, "%s (%s) not in a subgroup\n",
+					ifname, inet_ntoa(ip));
+			close(sock);
+			return -1;
+		}
+
+		/* replace ipv4 with the real address */
+		*ipv4 = ip;
 	}
 
-	*ipv4 = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
 	close(sock);
 	return 0;
 }
 
 static int if_param(char *ifname, int *ifindex, uint8_t *mac,
-		    struct in_addr *ifip)
+		    struct in_addr *server_ip)
 {
 	if ((*ifindex = if_nametoindex(ifname)) == 0) {
 		fprintf(stderr, "get ifindex failed: %s\n", strerror(errno));
@@ -122,20 +172,19 @@ static int if_param(char *ifname, int *ifindex, uint8_t *mac,
 	if (-1 == get_ifhwaddr(ifname, mac))
 		return -1;
 
-	if (-1 == get_ifaddr(ifname, ifip))
+	if (-1 == get_set_ifaddr(ifname, server_ip))
 		return -1;
 
 	printf("hw addr of %s: %02x:%02x:%02x:%02x:%02x:%02x\n", ifname, mac[0],
 	       mac[1], mac[2], mac[3], mac[4], mac[5]);
-	printf("ip addr of %s: %s\n", ifname, inet_ntoa(*ifip));
+	printf("ip addr of %s: %s\n", ifname, inet_ntoa(*server_ip));
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
 	char *ifname = NULL;
-	struct in_addr ifip;
-	struct in_addr client_ip = { 0 };
+	struct in_addr client_ip = { 0 }, server_ip = { 0 };
 	unsigned char mac[6];
 	int opt;
 	int daemon = 0;
@@ -145,6 +194,7 @@ int main(int argc, char **argv)
 	int uid = 0;
 	char *rootdir = NULL;
 	struct passwd *pwd;
+	uint16_t vid = 0xffff, pid = 0xffff;
 
 	int sock_dhcp;
 	int sock_tftp;
@@ -168,6 +218,20 @@ int main(int argc, char **argv)
 			if (0 == inet_aton(optarg, &client_ip)) {
 				fprintf(stderr, "Invalid rpi ip\n");
 				return -1;
+			} else {
+				uint32_t c = ntohl(client_ip.s_addr), s = c;
+
+				/* the default server ip is .1 */
+				s &= 0xffffff00;
+				s |= 1;
+				server_ip.s_addr = htonl(s);
+
+				if ((c & 0xff) == 1) {
+					/* fix the client ip to .2 */
+					c &= 0xffffff00;
+					c |= 2;
+					client_ip.s_addr = htonl(c);
+				}
 			}
 			break;
 		case 'u':
@@ -182,7 +246,23 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (-1 == if_param(ifname, &ifindex, mac, &ifip))
+	if (strchr(ifname, ':')) {
+		char *endp = NULL;
+
+		vid = strtoul(ifname, &endp, 16);
+		if (!endp || *endp != ':') {
+			fprintf(stderr, "invalid usb vid:pid interface\n");
+			return -1;
+		}
+
+		pid = strtoul(endp + 1, &endp, 16);
+		if (!endp || *endp != '\0') {
+			fprintf(stderr, "invalid usb vid:pid interface\n");
+			return -1;
+		}
+	}
+
+	if (-1 == if_param(ifname, &ifindex, mac, &server_ip))
 		return 1;
 
 	printf("ip addr allocated to rpi: %s\n", inet_ntoa(client_ip));
@@ -190,7 +270,7 @@ int main(int argc, char **argv)
 	if ((sock_dhcp = dhcp_sock(ifindex)) == -1)
 		return 1;
 
-	if ((sock_tftp = tftp_init(ifip.s_addr, conn, MAX_TFTP_CONN)) == -1)
+	if ((sock_tftp = tftp_init(server_ip.s_addr, conn, MAX_TFTP_CONN)) == -1)
 		return 1;
 
 	if (rootdir) {
@@ -274,7 +354,7 @@ int main(int argc, char **argv)
 		}
 
 		if (FD_ISSET(sock_dhcp, &rfds))
-			process_dhcp(sock_dhcp, mac, ifip.s_addr,
+			process_dhcp(sock_dhcp, mac, server_ip.s_addr,
 				     client_ip.s_addr);
 
 		for (i = 0; i < MAX_TFTP_CONN; i++) {
@@ -283,7 +363,7 @@ int main(int argc, char **argv)
 		}
 
 		if (FD_ISSET(sock_tftp, &rfds))
-			process_tftp_req(sock_tftp, ifip.s_addr, conn,
+			process_tftp_req(sock_tftp, server_ip.s_addr, conn,
 					 MAX_TFTP_CONN);
 	}
 

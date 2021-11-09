@@ -25,6 +25,10 @@
 
 #include "dhcpd.h"
 
+#define OPT_CODE 0
+#define OPT_LEN 1
+#define OPT_DATA 2
+
 #define DHCP_SERVER_PORT 67
 #define DHCP_CLIENT_PORT 68
 #define DHCP_MAGIC 0x63825363
@@ -149,166 +153,89 @@ static int dhcp_set_filter(int sock)
 	return packet_set_filter(sock, dhcp_filter, ARRAY_SIZE(dhcp_filter));
 }
 
-static int process_rpi_dhcp(char *buf, int buflen, unsigned char *mac,
-			    unsigned char *uuid, int *uuid_len)
+static uint8_t *udhcp_get_option(struct dhcp_packet *packet, int code)
 {
-	struct dhcp_raw_packet *packet = (struct dhcp_raw_packet *)buf;
-	struct dhcp_packet *dhcp;
-	int iplen, udplen;
-	uint16_t check;
-	uint8_t *opt;
-	int i;
-	int rpi_dhcp = 0;
+	uint8_t *optionptr;
+	int len;
+	int rem;
 
-	if (buflen < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN)
-		return -1;
-
-	memcpy(mac, packet->eth_hdr.h_source, 6);
-
-	iplen = ntohs(packet->ip_hdr.tot_len);
-	udplen = ntohs(packet->udp_hdr.len);
-
-	if (iplen + ETH_HDR_LEN > buflen)
-		return -1;
-
-	if (packet->ip_hdr.protocol != IPPROTO_UDP ||
-	    packet->ip_hdr.version != IPVERSION ||
-	    packet->ip_hdr.ihl != (IP_HDR_LEN >> 2) ||
-	    iplen != IP_HDR_LEN + udplen) {
-		fprintf(stderr, "unrelated/bogus packet, ignoring\n");
-		return -1;
-	}
-
-	check = packet->ip_hdr.check;
-	packet->ip_hdr.check = 0;
-	if (check != inet_cksum((uint16_t *)&packet->ip_hdr, IP_HDR_LEN)) {
-		fprintf(stderr, "bad IP header checksum, ignoring\n");
-		return -1;
-	}
-
-	/* verify UDP checksum. IP header has to be modified for this */
-	memset(&packet->ip_hdr, 0, offsetof(struct iphdr, protocol));
-	/* ip.xx fields which are not memset: protocol, check, saddr, daddr */
-	packet->ip_hdr.tot_len = packet->udp_hdr.len; /* yes, this is needed */
-	check = packet->udp_hdr.check;
-	packet->udp_hdr.check = 0;
-	if (check && check != inet_cksum((uint16_t *)&packet->ip_hdr, iplen)) {
-		fprintf(stderr,
-			"packet with bad UDP checksum received, ignoring\n");
-		return -1;
-	}
-
-	if (packet->udp_hdr.source != htons(DHCP_CLIENT_PORT) ||
-	    packet->udp_hdr.dest != htons(DHCP_SERVER_PORT))
-		return -1;
-
-	if (packet->dhcp_packet.cookie != htonl(DHCP_MAGIC)) {
-		fprintf(stderr, "packet with bad magic, ignoring\n");
-		return -1;
-	}
-
-	dhcp = &packet->dhcp_packet;
-	if (dhcp->op != BOOTREQUEST)
-		return -1;
-
-	opt = dhcp->options;
-	while (opt < (uint8_t *)(buf + buflen)) {
-		if (*opt == DHCP_END || *opt == 0)
-			break;
-		else if (*opt == DHCP_MESSAGE_TYPE) {
-			if (*(opt + 2) != DHCPDISCOVER)
-				return -1;
-		} else if (*opt == DHCP_PARAM_REQ) {
-			unsigned char len = *(opt + 1);
-			for (i = 0; i < len; i++) {
-				if (*(opt + 2 + i) == DHCP_TFTP_SERVER_NAME) {
-					rpi_dhcp |= 1;
-				}
-			}
-		} else if (*opt == DHCP_UUID_CLASS_ID) {
-			rpi_dhcp |= 2;
-			*uuid_len = opt[1];
-			memcpy(uuid, opt + 2, opt[1]);
+	/* option bytes: [code][len][data1][data2]..[dataLEN] */
+	optionptr = packet->options;
+	rem = sizeof(packet->options);
+	while (1) {
+		if (rem <= 0) {
+			fprintf(stderr, "bad packet, malformed option field\n");
+			return NULL;
 		}
-		opt += 2 + *(opt + 1);
+
+		if (optionptr[OPT_CODE] == DHCP_END)
+			break;
+
+		len = 2 + optionptr[OPT_LEN];
+		rem -= len;
+		if (rem < 0)
+			continue; /* complain and return NULL */
+
+		if (optionptr[OPT_CODE] == code) /* Option found */
+			return optionptr + OPT_DATA;
+
+		optionptr += len;
 	}
 
-	if (rpi_dhcp == 3)
-		printf("recv a rpi dhcp discover packet\n");
-
-	return (rpi_dhcp == 3) ? 0 : -1;
+	return NULL;
 }
 
-static int construct_rpi_dhcp_offer(char *buf, int bufsize,
-				    unsigned char *src_mac,
-				    unsigned char *dst_mac, uint32_t svr_ip,
-				    uint32_t rpi_ip, unsigned char *uuid,
-				    int uuid_len)
+static int udhcp_end_option(uint8_t *optionptr)
 {
-	struct dhcp_raw_packet *raw = (struct dhcp_raw_packet *)buf;
+	int i = 0;
+
+	while (optionptr[i] != DHCP_END) {
+		if (optionptr[i] != DHCP_PADDING)
+			i += optionptr[i + OPT_LEN] + OPT_DATA-1;
+		i++;
+	}
+	return i;
+}
+
+static void dhcp_offer_prepare(struct dhcp_raw_packet *raw, uint8_t *src_mac,
+			       uint8_t *dst_mac, uint32_t src_ip,
+			       uint32_t dst_ip)
+{
 	struct dhcp_packet *packet = &raw->dhcp_packet;
-	uint8_t *next_opt;
-	int i;
-	uint16_t d16;
-	int dhcp_len;
 
-	if (bufsize < sizeof(*raw))
-		return -1;
-
-	memset(buf, 0, sizeof(*raw));
+	memset(raw, 0, sizeof(*raw));
 
 	packet->op = BOOTREPLY;
 	packet->htype = 1;
 	packet->hlen = 6;
-	if (rpi_ip) {
-		packet->yiaddr = rpi_ip;
-		packet->siaddr_nip = svr_ip;
+	if (dst_ip) {
+		packet->yiaddr = dst_ip;
+		packet->siaddr_nip = src_ip;
 	}
 	packet->cookie = htonl(DHCP_MAGIC);
 	memcpy(packet->chaddr, dst_mac, 6);
-
-	next_opt = packet->options;
-	next_opt[0] = DHCP_MESSAGE_TYPE;
-	next_opt[1] = 1;
-	next_opt[2] = DHCPOFFER;
-	next_opt += 3;
-
-	next_opt[0] = DHCP_TFTP_SERVER_IP;
-	next_opt[1] = 4;
-	memcpy(&next_opt[2], &svr_ip, 4);
-	next_opt += 6;
-
-	next_opt[0] = DHCP_VENDOR_CLASS_ID;
-	next_opt[1] = strlen(VENDOR_ID);
-	strcpy(&next_opt[2], VENDOR_ID);
-	next_opt += 2 + strlen(VENDOR_ID);
-
-	next_opt[0] = DHCP_UUID_CLASS_ID;
-	next_opt[1] = uuid_len;
-	memcpy(&next_opt[2], uuid, uuid_len);
-	next_opt += 2 + uuid_len;
-
-	next_opt[0] = DHCP_VENDOR_INFO;
-	next_opt[1] = sizeof(vendor_info_data);
-	memcpy(&next_opt[2], vendor_info_data, sizeof(vendor_info_data));
-	next_opt += 2 + sizeof(vendor_info_data);
-
-	next_opt[0] = DHCP_END;
-
-	dhcp_len = (1 + next_opt - (uint8_t *)packet);
-	if (dhcp_len < 300)
-		dhcp_len = 300;
+	packet->options[0] = DHCP_END;
 
 	memcpy(raw->eth_hdr.h_dest, dst_mac, ETH_ALEN);
 	memcpy(raw->eth_hdr.h_source, src_mac, ETH_ALEN);
 	raw->eth_hdr.h_proto = htons(ETH_P_IP);
 
 	raw->ip_hdr.protocol = IPPROTO_UDP;
-	raw->ip_hdr.saddr = svr_ip;
+	raw->ip_hdr.saddr = src_ip;
 	raw->ip_hdr.daddr = INADDR_BROADCAST;
 
 	raw->udp_hdr.source = htons(DHCP_SERVER_PORT);
 	raw->udp_hdr.dest = htons(DHCP_CLIENT_PORT);
+}
+
+static int dhcp_offer_finish(struct dhcp_raw_packet *raw)
+{
+	int dhcp_len = offsetof(struct dhcp_packet, options)
+			+ udhcp_end_option(raw->dhcp_packet.options);
+
+	if (dhcp_len < 300)
+		dhcp_len = 300;
+
 	raw->udp_hdr.len = htons(UDP_HDR_LEN + dhcp_len);
 	raw->ip_hdr.tot_len = raw->udp_hdr.len;
 	raw->udp_hdr.check = inet_cksum((uint16_t *)&raw->ip_hdr,
@@ -320,7 +247,119 @@ static int construct_rpi_dhcp_offer(char *buf, int bufsize,
 	raw->ip_hdr.ttl = IPDEFTTL;
 	raw->ip_hdr.check = inet_cksum((uint16_t *)&raw->ip_hdr, IP_HDR_LEN);
 
-	return (ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN + dhcp_len);
+	return ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN + dhcp_len;
+}
+
+static struct dhcp_packet *get_dhcp_packet(uint8_t *buf, int buflen, uint8_t *mac)
+{
+	struct dhcp_raw_packet *packet = (struct dhcp_raw_packet *)buf;
+	struct dhcp_packet *dhcp;
+	int iplen, udplen;
+	uint16_t check;
+	uint8_t *opt;
+
+	if (buflen < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN)
+		return NULL;
+
+	memcpy(mac, packet->eth_hdr.h_source, 6);
+
+	iplen = ntohs(packet->ip_hdr.tot_len);
+	udplen = ntohs(packet->udp_hdr.len);
+
+	if (iplen + ETH_HDR_LEN > buflen)
+		return NULL;
+
+	if (packet->ip_hdr.protocol != IPPROTO_UDP ||
+	    packet->ip_hdr.version != IPVERSION ||
+	    packet->ip_hdr.ihl != (IP_HDR_LEN >> 2) ||
+	    iplen != IP_HDR_LEN + udplen) {
+		fprintf(stderr, "unrelated/bogus packet, ignoring\n");
+		return NULL;
+	}
+
+	check = packet->ip_hdr.check;
+	packet->ip_hdr.check = 0;
+	if (check != inet_cksum((uint16_t *)&packet->ip_hdr, IP_HDR_LEN)) {
+		fprintf(stderr, "bad IP header checksum, ignoring\n");
+		return NULL;
+	}
+
+	/* verify UDP checksum. IP header has to be modified for this */
+	memset(&packet->ip_hdr, 0, offsetof(struct iphdr, protocol));
+	/* ip.xx fields which are not memset: protocol, check, saddr, daddr */
+	packet->ip_hdr.tot_len = packet->udp_hdr.len; /* yes, this is needed */
+	check = packet->udp_hdr.check;
+	packet->udp_hdr.check = 0;
+	if (check && check != inet_cksum((uint16_t *)&packet->ip_hdr, iplen)) {
+		fprintf(stderr,
+			"packet with bad UDP checksum received, ignoring\n");
+		return NULL;
+	}
+
+	if (packet->udp_hdr.source != htons(DHCP_CLIENT_PORT) ||
+	    packet->udp_hdr.dest != htons(DHCP_SERVER_PORT))
+		return NULL;
+
+	if (packet->dhcp_packet.cookie != htonl(DHCP_MAGIC)) {
+		fprintf(stderr, "packet with bad magic, ignoring\n");
+		return NULL;
+	}
+
+	dhcp = &packet->dhcp_packet;
+	if (dhcp->op != BOOTREQUEST)
+		return NULL;
+
+	return dhcp;
+}
+
+static void dhcp_options_add_u32(uint8_t **popt, uint8_t code, uint32_t data)
+{
+	uint8_t *opt = *popt;
+
+	opt[OPT_CODE] = code;
+	opt[OPT_LEN] = 4;
+	memcpy(&opt[OPT_DATA], &data, 4);
+	opt += 6;
+
+	*popt = opt;
+	opt[OPT_CODE] = DHCP_END;
+}
+
+static int process_am335x_dhcp(struct dhcp_packet *packet, uint8_t *mac,
+			       struct dhcp_raw_packet *ack)
+{
+	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
+	uint8_t *opt;
+
+	/* "vender-class-identifier" option number 60 (RFC 1497, RFC 1533).
+	 * Servers could use this information to identify the device type.
+	 * The value present is "AM335x ROM".
+	 */
+	opt = udhcp_get_option(packet, 60);
+	if (!opt || strncmp((char *)opt, "AM335x ROM", 10))
+		return -1;
+
+	/* "Client-identifier" option number 61 (RFC 1497, RFC 1533).
+	 * This has the ASIC-ID structure which contains additional
+	 * info for the device.
+	 */
+	opt = udhcp_get_option(packet, 61);
+	if (!opt)
+		return -1;
+
+	printf("New AM335x device: %02x-%02x-%02x-%02x-%02x-%02x\n",
+		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+	ack_dhcp->xid = htonl(1);
+	strncpy(ack_dhcp->file, "MLO", sizeof(ack_dhcp->file));
+
+	opt = ack_dhcp->options;
+	dhcp_options_add_u32(&opt,  3, ack->ip_hdr.saddr); /* Router */
+	dhcp_options_add_u32(&opt, 51, htonl(600)); /* IP Address Lease Time */
+	dhcp_options_add_u32(&opt,  1, htonl(0xffffff00)); /* Subnet mask */
+	dhcp_options_add_u32(&opt, 54, ack->ip_hdr.saddr); /* DHCP Server */
+
+	return 0;
 }
 
 int dhcp_sock(int ifindex)
@@ -353,42 +392,55 @@ int dhcp_sock(int ifindex)
 	return sock;
 }
 
-void process_dhcp(int sock, uint8_t *mac, uint32_t myip, uint32_t rpiip)
+static struct dhcp_packet *get_dhcp_packet_from_socket(int sock, uint8_t *mac)
 {
-	unsigned char rpi_mac[6];
+	static uint8_t buf[1600] = { 0 };
 	struct sockaddr_ll sll;
-	int addrlen;
-	unsigned char uuid[256];
-	int uuid_len;
-	char buf[1600];
 	int ret;
 
-	addrlen = sizeof(sll);
+	int addrlen = sizeof(sll);
 	ret = recvfrom(sock, buf, sizeof(buf), MSG_TRUNC,
 		       (struct sockaddr *)&sll, &addrlen);
 	if (ret < 0) {
-		if (errno == EINTR)
-			return;
-		fprintf(stderr, "recvfrom failed: %s\n", strerror(errno));
-		return;
+		if (errno != EINTR)
+			fprintf(stderr, "recvfrom failed: %s\n", strerror(errno));
+		return NULL;
 	} else if (ret == 0) {
 		fprintf(stderr, "recvfrom ret 0\n");
-		return;
+		return NULL;
 	}
 
 	if (sll.sll_pkttype == PACKET_OUTGOING)
-		return;
+		return NULL;
 
-	if (process_rpi_dhcp(buf, ret, rpi_mac, uuid, &uuid_len))
-		return;
+	return get_dhcp_packet(buf, ret, mac);
+}
 
-	ret = construct_rpi_dhcp_offer(buf, sizeof(buf), mac, rpi_mac, myip,
-				       rpiip, uuid, uuid_len);
-	if (ret > 0) {
-		ret = sendto(sock, buf, ret, 0, NULL, 0);
-		if (ret <= 0) {
+static void handle_dhcp_packet(int sock, struct dhcp_packet *packet,
+			       uint8_t *mac, uint8_t *dmac,
+			       uint32_t server_ip,
+			       uint32_t device_ip)
+{
+	struct dhcp_raw_packet ack;
+
+	dhcp_offer_prepare(&ack, mac, dmac, server_ip, device_ip);
+
+	if (packet && !process_am335x_dhcp(packet, dmac, &ack)) {
+		int len = dhcp_offer_finish(&ack);
+
+		if (sendto(sock, &ack, len, 0, NULL, 0) <= 0) {
 			fprintf(stderr, "sendto() failed: %s\n",
 				strerror(errno));
 		}
 	}
+}
+
+void process_dhcp(int sock, uint8_t *mac, uint32_t server_ip, uint32_t device_ip)
+{
+	uint8_t device_macaddr[6] = { 0 };
+
+	handle_dhcp_packet(sock,
+			   get_dhcp_packet_from_socket(sock, device_macaddr),
+			   mac, device_macaddr,
+			   server_ip, device_ip);
 }
