@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -78,7 +79,6 @@ struct dhcp_raw_packet {
 } __attribute__((packed));
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-#define offsetof(type, member) ((int)&((type *)0)->member)
 
 static unsigned char vendor_info_data[] = {
 	0x06, 0x01, 0x03, /* PXE Dsicovery control */
@@ -156,7 +156,7 @@ static int process_rpi_dhcp(char *buf, int buflen, unsigned char *mac,
 	struct dhcp_packet *dhcp;
 	int iplen, udplen;
 	uint16_t check;
-	unsigned char *opt;
+	uint8_t *opt;
 	int i;
 	int rpi_dhcp = 0;
 
@@ -212,7 +212,7 @@ static int process_rpi_dhcp(char *buf, int buflen, unsigned char *mac,
 		return -1;
 
 	opt = dhcp->options;
-	while (opt < buf + buflen) {
+	while (opt < (uint8_t *)(buf + buflen)) {
 		if (*opt == DHCP_END || *opt == 0)
 			break;
 		else if (*opt == DHCP_MESSAGE_TYPE) {
