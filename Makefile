@@ -1,8 +1,8 @@
 all:
-	$(CC) -o pinetbootd pinetbootd.c dhcpd.c tftpd.c usb_linux.c
+	$(CC) -o am335x_netbootd am335x_netbootd.c dhcpd.c tftpd.c usb.c
 
-clean:	
-	rm -fr pinetbootd
+clean:
+	rm -fr am335x_netbootd
 
 
 

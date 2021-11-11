@@ -1,6 +1,9 @@
 /*
- * Herbert Yuan <yuanjp@hust.edu.cn> 2018/5/27
- * qianfan Zhao <qianfanguijin@163.com> port to am335x platform.
+ * A dhcp & tftp server tools for am335x network/usb boot
+ *
+ * History:
+ *   Herbert Yuan <yuanjp@hust.edu.cn> 2018/5/27
+ *   qianfan Zhao <qianfanguijin@163.com> port to am335x platform.
  */
 #include <errno.h>
 #include <getopt.h>
