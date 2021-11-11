@@ -385,6 +385,38 @@ void tftp_do(struct tftp_conn *conn)
 	conn->ts = monotonic_ts();
 }
 
+struct ch_toc {
+	uint32_t section_offset;
+	uint32_t section_size;
+	uint8_t unused[12];
+	uint8_t section_name[12];
+};
+
+static int is_am335x_toc(struct ch_toc *toc)
+{
+	return toc->section_offset == 0x40
+		&& toc->section_size == 0x0c
+		&& !strcmp(toc->section_name, "CHSETTINGS");
+}
+
+static int am335x_mlo_skip_toc(int fd)
+{
+	struct ch_toc toc;
+	int len;
+
+	len = read(fd, &toc, sizeof(toc));
+	if (len != sizeof(toc)) {
+		fprintf(stderr, "%s: read toc failed\n", __func__);
+		return -1;
+	}
+
+	/* Skip TOC (512 bytes) and GP header (8 bytes), total 520 bytes. */
+	len = is_am335x_toc(&toc) ? 512 + 8: 0;
+	lseek(fd, len, SEEK_SET);
+
+	return 0;
+}
+
 int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 {
 	char buf[1600];
@@ -483,6 +515,9 @@ int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 	} else {
 		conn[i].opcode = type;
 	}
+
+	if (!strcmp(name, "MLO"))
+		am335x_mlo_skip_toc(fd);
 
 	tftp_do(&conn[i]);
 	return 0;
