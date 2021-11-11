@@ -2,6 +2,6 @@
 #define DHCPD_H_
 
 int dhcp_sock(int ifindex);
-void process_dhcp(int sock, uint8_t *mac, uint32_t myip, uint32_t rpiip);
+int process_dhcp(int sock, uint8_t *mac, struct in_addr *s, struct in_addr *c);
 
 #endif

@@ -325,7 +325,7 @@ static void dhcp_options_add_u32(uint8_t **popt, uint8_t code, uint32_t data)
 	opt[OPT_CODE] = DHCP_END;
 }
 
-static int process_am335x_dhcp(struct dhcp_packet *packet, uint8_t *mac,
+static int process_am335x_dhcp(struct dhcp_packet *packet,
 			       struct dhcp_raw_packet *ack)
 {
 	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
@@ -346,9 +346,6 @@ static int process_am335x_dhcp(struct dhcp_packet *packet, uint8_t *mac,
 	opt = udhcp_get_option(packet, 61);
 	if (!opt)
 		return -1;
-
-	printf("New AM335x device: %02x-%02x-%02x-%02x-%02x-%02x\n",
-		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
 	ack_dhcp->xid = htonl(1);
 	strncpy(ack_dhcp->file, "MLO", sizeof(ack_dhcp->file));
@@ -392,24 +389,25 @@ int dhcp_sock(int ifindex)
 	return sock;
 }
 
-static struct dhcp_packet *get_dhcp_packet_from_socket(int sock, uint8_t *mac)
+static struct dhcp_packet *get_dhcp_packet_from_socket(int sock, uint8_t *mac,
+						       int *netdown)
 {
 	static uint8_t buf[1600] = { 0 };
 	struct sockaddr_ll sll;
 	int ret;
 
 	int addrlen = sizeof(sll);
+	*netdown = -1;
 	ret = recvfrom(sock, buf, sizeof(buf), MSG_TRUNC,
 		       (struct sockaddr *)&sll, &addrlen);
 	if (ret < 0) {
-		if (errno != EINTR)
-			fprintf(stderr, "recvfrom failed: %s\n", strerror(errno));
 		return NULL;
 	} else if (ret == 0) {
 		fprintf(stderr, "recvfrom ret 0\n");
 		return NULL;
 	}
 
+	*netdown = 0;
 	if (sll.sll_pkttype == PACKET_OUTGOING)
 		return NULL;
 
@@ -418,15 +416,19 @@ static struct dhcp_packet *get_dhcp_packet_from_socket(int sock, uint8_t *mac)
 
 static void handle_dhcp_packet(int sock, struct dhcp_packet *packet,
 			       uint8_t *mac, uint8_t *dmac,
-			       uint32_t server_ip,
-			       uint32_t device_ip)
+			       struct in_addr *s,
+			       struct in_addr *c)
 {
 	struct dhcp_raw_packet ack;
 
-	dhcp_offer_prepare(&ack, mac, dmac, server_ip, device_ip);
+	dhcp_offer_prepare(&ack, mac, dmac, s->s_addr, c->s_addr);
 
-	if (packet && !process_am335x_dhcp(packet, dmac, &ack)) {
+	if (packet && !process_am335x_dhcp(packet, &ack)) {
 		int len = dhcp_offer_finish(&ack);
+
+		printf("AM335x %02x:%02x:%02x:%02x:%02x:%02x take ip %s\n",
+			dmac[0], dmac[1], dmac[2], dmac[3],
+			dmac[4], dmac[5], inet_ntoa(*c));
 
 		if (sendto(sock, &ack, len, 0, NULL, 0) <= 0) {
 			fprintf(stderr, "sendto() failed: %s\n",
@@ -435,12 +437,15 @@ static void handle_dhcp_packet(int sock, struct dhcp_packet *packet,
 	}
 }
 
-void process_dhcp(int sock, uint8_t *mac, uint32_t server_ip, uint32_t device_ip)
+int process_dhcp(int sock, uint8_t *mac, struct in_addr *s, struct in_addr *c)
 {
 	uint8_t device_macaddr[6] = { 0 };
+	int netdown = 0;
 
 	handle_dhcp_packet(sock,
-			   get_dhcp_packet_from_socket(sock, device_macaddr),
+			   get_dhcp_packet_from_socket(sock, device_macaddr, &netdown),
 			   mac, device_macaddr,
-			   server_ip, device_ip);
+			   s, c);
+
+	return netdown;
 }

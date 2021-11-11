@@ -24,11 +24,33 @@
 #include <pwd.h>
 #include <sys/ioctl.h>
 
+#include "usb.h"
 #include "dhcpd.h"
 #include "tftpd.h"
 
+static uint16_t usb_vid = 0xffff, usb_pid = 0xffff;
+
+#define is_usb_network() (usb_vid != 0xffff || usb_pid != 0xffff)
+
 #define MAX_TFTP_CONN 32
 static struct tftp_conn conn[MAX_TFTP_CONN];
+
+static struct in_addr client_ip = { 0 };
+
+static void get_next_client_ip(struct in_addr *client)
+{
+	uint32_t n, c = ntohl(client_ip.s_addr);
+
+	*client = client_ip;
+
+	/* generate the next client ip in range [2, 200] */
+	n = (c & 0xff) + 1;
+	if (n > 200)
+		n = 2;
+	c &= 0xffffff00;
+	c |= n;
+	client_ip.s_addr = htonl(c);
+}
 
 static void usage(char *cmd)
 {
@@ -175,34 +197,124 @@ static int if_param(char *ifname, int *ifindex, uint8_t *mac,
 	if (-1 == get_set_ifaddr(ifname, server_ip))
 		return -1;
 
-	printf("hw addr of %s: %02x:%02x:%02x:%02x:%02x:%02x\n", ifname, mac[0],
-	       mac[1], mac[2], mac[3], mac[4], mac[5]);
-	printf("ip addr of %s: %s\n", ifname, inet_ntoa(*server_ip));
+	return 0;
+}
+
+static int network_work(char *ifname, struct in_addr server_ip)
+{
+	int i, sock_dhcp, sock_tftp, ifindex;
+	uint8_t mac[6] = { 0 };
+
+	if (if_param(ifname, &ifindex, mac, &server_ip) < 0)
+		return -1;
+
+	sock_dhcp = dhcp_sock(ifindex);
+	if (sock_dhcp < 0)
+		return -1;
+
+	sock_tftp = tftp_init(server_ip.s_addr, conn, MAX_TFTP_CONN);
+	if (sock_tftp < 0)
+		return -1;
+
+	while (1) {
+		int ret, maxfd;
+		struct timeval tv;
+		fd_set rfds;
+
+		FD_ZERO(&rfds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+
+		FD_SET(sock_dhcp, &rfds);
+		maxfd = sock_dhcp;
+
+		FD_SET(sock_tftp, &rfds);
+		if (sock_tftp > maxfd)
+			maxfd = sock_tftp;
+
+		for (i = 0; i < MAX_TFTP_CONN; i++) {
+			struct tftp_conn *tftp = &conn[i];
+
+			if (tftp->sock != -1) {
+				FD_SET(tftp->sock, &rfds);
+				if (tftp->sock > maxfd)
+					maxfd = tftp->sock;
+			}
+		}
+
+		ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+		if (ret < 0) {
+			if (errno != EINTR) {
+				fprintf(stderr, "select() failed: %s\n",
+					strerror(errno));
+				break;
+			}
+			break;
+		} else if (ret == 0) {
+			int ts = monotonic_ts();
+			for (i = 0; i < MAX_TFTP_CONN; i++) {
+				if (conn[i].sock == -1)
+					continue;
+				process_tftp_timeout(&conn[i], ts);
+			}
+			continue;
+		}
+
+		if (FD_ISSET(sock_dhcp, &rfds)) {
+			struct in_addr c;
+
+			get_next_client_ip(&c);
+			if (process_dhcp(sock_dhcp, mac, &server_ip, &c))
+				break;
+		}
+
+		for (i = 0; i < MAX_TFTP_CONN; i++) {
+			struct tftp_conn *tftp = &conn[i];
+
+			if (tftp->sock != -1 && FD_ISSET(tftp->sock, &rfds)) {
+				if (process_tftp_conn(tftp) < 0)
+					break;
+			}
+		}
+
+		if (FD_ISSET(sock_tftp, &rfds)) {
+			if (process_tftp_req(sock_tftp, server_ip.s_addr, conn,
+					 MAX_TFTP_CONN) < 0)
+				break;
+		}
+	}
+
+	printf("network %s down\n", ifname);
+
+	close(sock_dhcp);
+	close(sock_tftp);
+	for (i = 0; i < MAX_TFTP_CONN; i++) {
+		struct tftp_conn *tftp = &conn[i];
+
+		if (tftp->sock != -1) {
+			close(tftp->sock);
+			tftp->sock = -1;
+			if (tftp->fd > 0) {
+				close(tftp->fd);
+				tftp->fd = -1;
+			}
+		}
+	}
+
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
 	char *ifname = NULL;
-	struct in_addr client_ip = { 0 }, server_ip = { 0 };
-	unsigned char mac[6];
+	struct in_addr server_ip = { 0 };
+
 	int opt;
 	int daemon = 0;
-	int ifindex;
-	int ret;
 	char *user = NULL;
 	int uid = 0;
 	char *rootdir = NULL;
 	struct passwd *pwd;
-	uint16_t vid = 0xffff, pid = 0xffff;
-
-	int sock_dhcp;
-	int sock_tftp;
-
-	int i;
-	int maxfd;
-	struct timeval tv;
-	fd_set rfds;
 
 	if (argc < 2 || !strcmp("-h", argv[1]))
 		usage(argv[0]);
@@ -249,29 +361,18 @@ int main(int argc, char **argv)
 	if (strchr(ifname, ':')) {
 		char *endp = NULL;
 
-		vid = strtoul(ifname, &endp, 16);
+		usb_vid = strtoul(ifname, &endp, 16);
 		if (!endp || *endp != ':') {
 			fprintf(stderr, "invalid usb vid:pid interface\n");
 			return -1;
 		}
 
-		pid = strtoul(endp + 1, &endp, 16);
+		usb_pid = strtoul(endp + 1, &endp, 16);
 		if (!endp || *endp != '\0') {
 			fprintf(stderr, "invalid usb vid:pid interface\n");
 			return -1;
 		}
 	}
-
-	if (-1 == if_param(ifname, &ifindex, mac, &server_ip))
-		return 1;
-
-	printf("ip addr allocated to rpi: %s\n", inet_ntoa(client_ip));
-
-	if ((sock_dhcp = dhcp_sock(ifindex)) == -1)
-		return 1;
-
-	if ((sock_tftp = tftp_init(server_ip.s_addr, conn, MAX_TFTP_CONN)) == -1)
-		return 1;
 
 	if (rootdir) {
 		if (chdir(rootdir) == -1) {
@@ -301,9 +402,10 @@ int main(int argc, char **argv)
 			fprintf(stderr, "fork failed: %s\n", strerror(errno));
 			return 1;
 		}
-		if (pid > 0)
+
+		if (pid > 0) {
 			exit(0);
-		else {
+		} else {
 			int fd = open("/dev/null", O_RDWR);
 			if (fd > 0) {
 				dup2(fd, STDOUT_FILENO);
@@ -314,57 +416,31 @@ int main(int argc, char **argv)
 	}
 
 	while (1) {
-		FD_ZERO(&rfds);
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
+		if (is_usb_network()) {
+			static char eth[32] = { 0 };
+			struct usb_device device;
 
-		FD_SET(sock_dhcp, &rfds);
-		maxfd = sock_dhcp;
-
-		FD_SET(sock_tftp, &rfds);
-		if (sock_tftp > maxfd)
-			maxfd = sock_tftp;
-
-		for (i = 0; i < MAX_TFTP_CONN; i++) {
-			if (conn[i].sock != -1) {
-				FD_SET(conn[i].sock, &rfds);
-				if (conn[i].sock > maxfd)
-					maxfd = conn[i].sock;
+			if (find_usb_device(&device, usb_vid, usb_pid) < 0) {
+				usleep(250 * 1000);
+				continue;
 			}
+
+			/* waiting network ready */
+			usleep(500 * 1000);
+			if (usb_device_get_netadapter(&device, 0, eth, sizeof(eth)) < 0)
+				continue;
+
+			printf("New usb device %04x:%04x with network %s\n",
+				usb_vid, usb_pid, eth);
+			ifname = eth;
 		}
 
-		ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-		if (ret < 0) {
-			if (errno != EINTR) {
-				fprintf(stderr, "select() failed: %s\n",
-					strerror(errno));
-				break;
-			}
-			continue;
-		}
+		network_work(ifname, server_ip);
 
-		else if (ret == 0) {
-			int ts = monotonic_ts();
-			for (i = 0; i < MAX_TFTP_CONN; i++) {
-				if (conn[i].sock == -1)
-					continue;
-				process_tftp_timeout(&conn[i], ts);
-			}
-			continue;
-		}
+		/* wating sometimes until sysfs usb device is cleanup */
+		sleep(is_usb_network());
 
-		if (FD_ISSET(sock_dhcp, &rfds))
-			process_dhcp(sock_dhcp, mac, server_ip.s_addr,
-				     client_ip.s_addr);
-
-		for (i = 0; i < MAX_TFTP_CONN; i++) {
-			if (conn[i].sock != -1 && FD_ISSET(conn[i].sock, &rfds))
-				process_tftp_conn(&conn[i]);
-		}
-
-		if (FD_ISSET(sock_tftp, &rfds))
-			process_tftp_req(sock_tftp, server_ip.s_addr, conn,
-					 MAX_TFTP_CONN);
+		printf("\n");
 	}
 
 	return 0;

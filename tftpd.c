@@ -385,7 +385,7 @@ void tftp_do(struct tftp_conn *conn)
 	conn->ts = monotonic_ts();
 }
 
-void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
+int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 {
 	char buf[1600];
 	int ret;
@@ -402,17 +402,16 @@ void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 
 	ret = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&addr,
 		       &addrlen);
-	if (ret <= 0) {
-		fprintf(stderr, "recvfrom failed: %s\n", strerror(errno));
-		return;
-	}
+	if (ret <= 0)
+		return -1;
+
 	if (ret <= 6)
-		return;
+		return 0;
 
 	type = ntohs(*(unsigned short *)buf);
 	if (type != TFTP_OP_RRQ && type != TFTP_OP_WRQ) {
 		fprintf(stderr, "unsupported type\n");
-		return;
+		return 0;
 	}
 	name = buf + 2;
 	for (i = 2; i < ret; i++)
@@ -422,14 +421,14 @@ void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 		}
 	if (mode == NULL || mode >= buf + ret ||
 	    mode + strlen(mode) + 1 > buf + ret)
-		return;
+		return 0;
 	if (!strcasecmp(mode, TFTP_MODE_RAW))
 		convert = 0;
 	else if (!strcasecmp(mode, TFTP_MODE_ASCII))
 		convert = 1;
 	else {
 		fprintf(stderr, "unsupported mode\n");
-		return;
+		return 0;
 	}
 
 	printf("tftp request %s %s, mode %s\n",
@@ -441,13 +440,13 @@ void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 			break;
 	if (i >= num) {
 		fprintf(stderr, "no idle connection\n");
-		return;
+		return 0;
 	}
 
 	sock_conn = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock_conn < 0) {
 		fprintf(stderr, "socket() failed: %s\n", strerror(errno));
-		return;
+		return 0;
 	}
 
 	memset(&srvaddr, 0, sizeof(srvaddr));
@@ -459,7 +458,7 @@ void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 	    -1) {
 		fprintf(stderr, "bind failed: %s\n", strerror(errno));
 		close(sock_conn);
-		return;
+		return 0;
 	}
 
 	if (type == TFTP_OP_RRQ)
@@ -486,10 +485,10 @@ void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 	}
 
 	tftp_do(&conn[i]);
-	return;
+	return 0;
 }
 
-void process_tftp_conn(struct tftp_conn *conn)
+int process_tftp_conn(struct tftp_conn *conn)
 {
 	char buf[1600];
 	int ret;
@@ -500,12 +499,15 @@ void process_tftp_conn(struct tftp_conn *conn)
 
 	ret = recvfrom(conn->sock, buf, sizeof(buf), 0,
 		       (struct sockaddr *)&addr, &addrlen);
+	if (ret <= 0)
+		return -1;
+
 	if (ret < 4)
-		return;
+		return 0;
 	if (addr.sin_addr.s_addr != conn->client_ip ||
 	    addr.sin_port != conn->client_port) {
 		fprintf(stderr, "other peoples packet\n");
-		return;
+		return 0;
 	}
 
 	opcode = ntohs(*(unsigned short *)buf);
@@ -514,7 +516,7 @@ void process_tftp_conn(struct tftp_conn *conn)
 	switch (opcode) {
 	case TFTP_OP_DATA:
 		if (conn->type != TFTP_OP_WRQ)
-			return;
+			return 0;
 		/* fall through */
 	case TFTP_OP_ERR:
 		conn->buf = buf + 4;
@@ -522,15 +524,17 @@ void process_tftp_conn(struct tftp_conn *conn)
 		break;
 	case TFTP_OP_ACK:
 		if (conn->type != TFTP_OP_RRQ)
-			return;
+			return 0;
 		break;
 	default:
-		return;
+		return 0;
 	}
 
 	conn->opcode = opcode;
 	conn->data = data;
 	tftp_do(conn);
+
+	return 0;
 }
 
 void process_tftp_timeout(struct tftp_conn *conn, int ts)

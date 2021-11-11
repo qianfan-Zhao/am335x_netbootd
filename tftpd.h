@@ -56,9 +56,9 @@ int monotonic_ts();
 int tftp_init(uint32_t ip, struct tftp_conn *conn, int num);
 void tftp_conn_release(struct tftp_conn *conn);
 void tftp_do(struct tftp_conn *conn);
-void process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn,
+int  process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn,
 		      int num);
-void process_tftp_conn(struct tftp_conn *conn);
+int  process_tftp_conn(struct tftp_conn *conn);
 void process_tftp_timeout(struct tftp_conn *conn, int timeout);
 
 #endif
