@@ -349,7 +349,7 @@ static int process_am335x_dhcp(struct dhcp_packet *packet,
 		return -1;
 #endif
 
-	ack_dhcp->xid = htonl(1);
+	ack_dhcp->xid = packet->xid;
 	if (bootfile)
 		strncpy(ack_dhcp->file, bootfile, sizeof(ack_dhcp->file));
 
