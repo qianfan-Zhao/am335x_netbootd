@@ -27,13 +27,28 @@
 #include <pwd.h>
 #include <sys/ioctl.h>
 
-#include "usb.h"
 #include "dhcpd.h"
 #include "tftpd.h"
+#include "netboot_device.h"
 
-static uint16_t usb_vid = 0xffff, usb_pid = 0xffff;
+static int filter_usb_device(struct usb_device *usb)
+{
+	struct netboot_device *dev = (struct netboot_device *)usb;
 
-#define is_usb_network() (usb_vid != 0xffff || usb_pid != 0xffff)
+	if (usb->vid == 0x0451 && usb->pid == 0x6141) { /* AM335x ROM */
+		snprintf(dev->bootfile, sizeof(dev->bootfile) - 1, "MLO");
+		dev->usb_bNumberConfigration = 1;
+		dev->usb_bInterfaceNumber = 0;
+		return 0;
+	} else if (usb->vid == 0x0451 && usb->pid == 0xd022) { /* AM335x SPL */
+		snprintf(dev->bootfile, sizeof(dev->bootfile) - 1, "u-boot.img");
+		dev->usb_bNumberConfigration = 2;
+		dev->usb_bInterfaceNumber = 0;
+		return 0;
+	}
+
+	return -1;
+}
 
 #define MAX_TFTP_CONN 32
 static struct tftp_conn conn[MAX_TFTP_CONN];
@@ -58,16 +73,15 @@ static void get_next_client_ip(struct in_addr *client)
 static void usage(char *cmd)
 {
 	fprintf(stderr,
-		"%s <interface> [-c rpi_ip] [-C tftproot] [-u username] [-d]\n",
+		"%s [interface] [-c rpi_ip] [-C tftproot] [-u username] [-d]\n",
 		cmd);
 	fprintf(stderr,
 		"<interface>, listen on this interface,\n"
 		"             and use the ip address of this interface \n"
 		"             as the tftp server address\n"
 		"             interface can be ethernet such as eth0\n"
-		"             or a usb network selected by vid:pid,\n"
-		"             will auto set usb network's ip address based on\n"
-		"             -c options, ipv4 address .1 is server ip\n");
+		"             will search all supported usb network if\n"
+		"             [interface] is not selected\n");
 	fprintf(stderr, "-d,          daemon mode\n");
 	fprintf(stderr, "-c ip,       allocate this ip to rpi,\n"
 			"             if you has dhcp server in your LAN ENV,\n"
@@ -203,19 +217,20 @@ static int if_param(char *ifname, int *ifindex, uint8_t *mac,
 	return 0;
 }
 
-static int network_work(char *ifname, struct in_addr server_ip)
+static int network_work(struct netboot_device *dev)
 {
 	int i, sock_dhcp, sock_tftp, ifindex;
-	uint8_t mac[6] = { 0 };
+	char *ifname = dev->net_ifname;
+	uint8_t *mac = dev->mac;
 
-	if (if_param(ifname, &ifindex, mac, &server_ip) < 0)
+	if (if_param(ifname, &ifindex, mac, &dev->ip_server) < 0)
 		return -1;
 
 	sock_dhcp = dhcp_sock(ifindex);
 	if (sock_dhcp < 0)
 		return -1;
 
-	sock_tftp = tftp_init(server_ip.s_addr, conn, MAX_TFTP_CONN);
+	sock_tftp = tftp_init(dev->ip_server.s_addr, conn, MAX_TFTP_CONN);
 	if (sock_tftp < 0)
 		return -1;
 
@@ -264,10 +279,8 @@ static int network_work(char *ifname, struct in_addr server_ip)
 		}
 
 		if (FD_ISSET(sock_dhcp, &rfds)) {
-			struct in_addr c;
-
-			get_next_client_ip(&c);
-			if (process_dhcp(sock_dhcp, mac, &server_ip, &c))
+			get_next_client_ip(&dev->ip_client);
+			if (process_dhcp(sock_dhcp, dev))
 				break;
 		}
 
@@ -281,7 +294,7 @@ static int network_work(char *ifname, struct in_addr server_ip)
 		}
 
 		if (FD_ISSET(sock_tftp, &rfds)) {
-			if (process_tftp_req(sock_tftp, server_ip.s_addr, conn,
+			if (process_tftp_req(sock_tftp, dev->ip_server.s_addr, conn,
 					 MAX_TFTP_CONN) < 0)
 				break;
 		}
@@ -309,8 +322,7 @@ static int network_work(char *ifname, struct in_addr server_ip)
 
 int main(int argc, char **argv)
 {
-	char *ifname = NULL;
-	struct in_addr server_ip = { 0 };
+	struct netboot_device netboot, *device = &netboot;
 
 	int opt;
 	int daemon = 0;
@@ -322,8 +334,6 @@ int main(int argc, char **argv)
 	if (argc < 2 || !strcmp("-h", argv[1]))
 		usage(argv[0]);
 
-	ifname = argv[1];
-	optind = 2;
 	while ((opt = getopt(argc, argv, "hdc:u:C:")) != -1) {
 		switch (opt) {
 		case 'd':
@@ -339,7 +349,7 @@ int main(int argc, char **argv)
 				/* the default server ip is .1 */
 				s &= 0xffffff00;
 				s |= 1;
-				server_ip.s_addr = htonl(s);
+				device->ip_server.s_addr = htonl(s);
 
 				if ((c & 0xff) == 1) {
 					/* fix the client ip to .2 */
@@ -361,20 +371,12 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (strchr(ifname, ':')) {
-		char *endp = NULL;
-
-		usb_vid = strtoul(ifname, &endp, 16);
-		if (!endp || *endp != ':') {
-			fprintf(stderr, "invalid usb vid:pid interface\n");
-			return -1;
-		}
-
-		usb_pid = strtoul(endp + 1, &endp, 16);
-		if (!endp || *endp != '\0') {
-			fprintf(stderr, "invalid usb vid:pid interface\n");
-			return -1;
-		}
+	if (optind < argc) {
+		snprintf(device->net_ifname, sizeof(device->net_ifname) - 1,
+			"%s", argv[optind]);
+		device->is_usb_network = 0;
+	} else {
+		device->is_usb_network = 1;
 	}
 
 	if (rootdir) {
@@ -419,29 +421,31 @@ int main(int argc, char **argv)
 	}
 
 	while (1) {
-		if (is_usb_network()) {
-			static char eth[32] = { 0 };
-			struct usb_device device;
+		if (device->is_usb_network) {
+			struct usb_device *usb = &device->usb;
 
-			if (find_usb_device(&device, usb_vid, usb_pid) < 0) {
+			if (find_usb_device(usb, filter_usb_device) < 0) {
 				usleep(250 * 1000);
 				continue;
 			}
 
 			/* waiting network ready */
 			usleep(500 * 1000);
-			if (usb_device_get_netadapter(&device, 0, eth, sizeof(eth)) < 0)
+			if (usb_device_get_netadapter(usb,
+						device->usb_bNumberConfigration,
+						device->usb_bInterfaceNumber,
+						device->net_ifname,
+						sizeof(device->net_ifname)) < 0)
 				continue;
 
 			printf("New usb device %04x:%04x with network %s\n",
-				usb_vid, usb_pid, eth);
-			ifname = eth;
+				usb->vid, usb->pid, device->net_ifname);
 		}
 
-		network_work(ifname, server_ip);
+		network_work(device);
 
 		/* wating sometimes until sysfs usb device is cleanup */
-		sleep(is_usb_network());
+		sleep(device->is_usb_network);
 
 		printf("\n");
 	}

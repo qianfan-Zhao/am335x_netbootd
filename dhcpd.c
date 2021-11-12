@@ -326,11 +326,12 @@ static void dhcp_options_add_u32(uint8_t **popt, uint8_t code, uint32_t data)
 }
 
 static int process_am335x_dhcp(struct dhcp_packet *packet,
-			       struct dhcp_raw_packet *ack)
+			       struct dhcp_raw_packet *ack, const char *bootfile)
 {
 	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
 	uint8_t *opt;
 
+#if 0
 	/* "vender-class-identifier" option number 60 (RFC 1497, RFC 1533).
 	 * Servers could use this information to identify the device type.
 	 * The value present is "AM335x ROM".
@@ -346,9 +347,11 @@ static int process_am335x_dhcp(struct dhcp_packet *packet,
 	opt = udhcp_get_option(packet, 61);
 	if (!opt)
 		return -1;
+#endif
 
 	ack_dhcp->xid = htonl(1);
-	strncpy(ack_dhcp->file, "MLO", sizeof(ack_dhcp->file));
+	if (bootfile)
+		strncpy(ack_dhcp->file, bootfile, sizeof(ack_dhcp->file));
 
 	opt = ack_dhcp->options;
 	dhcp_options_add_u32(&opt,  3, ack->ip_hdr.saddr); /* Router */
@@ -417,13 +420,14 @@ static struct dhcp_packet *get_dhcp_packet_from_socket(int sock, uint8_t *mac,
 static void handle_dhcp_packet(int sock, struct dhcp_packet *packet,
 			       uint8_t *mac, uint8_t *dmac,
 			       struct in_addr *s,
-			       struct in_addr *c)
+			       struct in_addr *c,
+			       const char *bootfile)
 {
 	struct dhcp_raw_packet ack;
 
 	dhcp_offer_prepare(&ack, mac, dmac, s->s_addr, c->s_addr);
 
-	if (packet && !process_am335x_dhcp(packet, &ack)) {
+	if (packet && !process_am335x_dhcp(packet, &ack, bootfile)) {
 		int len = dhcp_offer_finish(&ack);
 
 		printf("AM335x %02x:%02x:%02x:%02x:%02x:%02x take ip %s\n",
@@ -437,15 +441,17 @@ static void handle_dhcp_packet(int sock, struct dhcp_packet *packet,
 	}
 }
 
-int process_dhcp(int sock, uint8_t *mac, struct in_addr *s, struct in_addr *c)
+int process_dhcp(int sock, struct netboot_device *dev)
 {
 	uint8_t device_macaddr[6] = { 0 };
 	int netdown = 0;
 
 	handle_dhcp_packet(sock,
 			   get_dhcp_packet_from_socket(sock, device_macaddr, &netdown),
-			   mac, device_macaddr,
-			   s, c);
+			   dev->mac, device_macaddr,
+			   &dev->ip_server,
+			   &dev->ip_client,
+			   dev->bootfile);
 
 	return netdown;
 }

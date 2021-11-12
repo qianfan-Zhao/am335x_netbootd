@@ -96,13 +96,13 @@ static int parse_sys_bus_usb_devices(DIR *dir, struct usb_device *usb)
 	return 0;
 }
 
-int find_usb_device(struct usb_device *usb, uint16_t vid, uint16_t pid)
+int find_usb_device(struct usb_device *usb, int (*filter)(struct usb_device *))
 {
 	DIR *devs = opendir("/sys/bus/usb/devices");
 	int found = -1;
 
 	while (devs && !parse_sys_bus_usb_devices(devs, usb)) {
-		if (usb->vid == vid && usb->pid == pid) {
+		if (filter(usb) == 0) {
 			found = 0;
 			break;
 		}
@@ -137,15 +137,16 @@ static int usb_itfc_match_netadapter(struct dirent *entry)
 	return -1;
 }
 
-int usb_device_get_netadapter(struct usb_device *usb, int bInterfaceNum,
-			      char *ifname, size_t sz_ifname)
+int usb_device_get_netadapter(struct usb_device *usb, int bNumberConfigration,
+			      int bInterfaceNum, char *ifname, size_t sz_ifname)
 {
 	struct dirent *adapter;
 	char path[PATH_MAX];
 	DIR *dir;
 
-	snprintf(path, sizeof(path) - 1, "/sys/bus/usb/devices/%s/%s:1.%d/net",
-		 usb->usbpath, usb->usbpath, bInterfaceNum);
+	snprintf(path, sizeof(path) - 1, "/sys/bus/usb/devices/%s/%s:%d.%d/net",
+		 usb->usbpath, usb->usbpath,
+		 bNumberConfigration, bInterfaceNum);
 
 	dir = opendir(path);
 	if (!dir)

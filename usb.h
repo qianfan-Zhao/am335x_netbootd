@@ -21,7 +21,8 @@ struct usb_device {
 	int		bDeviceProtocol;
 };
 
-int find_usb_device(struct usb_device *usb, uint16_t vid, uint16_t pid);
-int usb_device_get_netadapter(struct usb_device *usb, int bInterfaceNum,
-			      char *ifname, size_t sz_ifname);
+int find_usb_device(struct usb_device *usb, int (*filter)(struct usb_device *));
+int usb_device_get_netadapter(struct usb_device *usb, int bNumberConfigration,
+			      int bInterfaceNum, char *ifname, size_t sz_ifname);
+
 #endif
