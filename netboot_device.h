@@ -19,7 +19,10 @@ struct netboot_device {
 	struct in_addr		ip_client;
 	struct in_addr		ip_server;
 	char			bootfile[128];
+	char			dhcp_vci[64];
 };
+
+void netboot_device_generate_client_ip(struct netboot_device *dev);
 
 #endif
 

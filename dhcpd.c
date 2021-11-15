@@ -49,6 +49,14 @@
 #define DHCPOFFER 2
 #define BROADCAST_FLAG 0x8000
 
+#define DHCP_DISCOVER 1
+#define DHCP_OFFER    2
+#define DHCP_REQUEST  3
+#define DHCP_DECLINE  4
+#define DHCP_ACK      5
+#define DHCP_NAK      6
+#define DHCP_RELEASE  7
+
 #define VENDOR_ID "PXEClient"
 
 struct dhcp_packet {
@@ -198,8 +206,7 @@ static int udhcp_end_option(uint8_t *optionptr)
 }
 
 static void dhcp_offer_prepare(struct dhcp_raw_packet *raw, uint8_t *src_mac,
-			       uint8_t *dst_mac, uint32_t src_ip,
-			       uint32_t dst_ip)
+			       uint8_t *dst_mac, uint32_t src_ip)
 {
 	struct dhcp_packet *packet = &raw->dhcp_packet;
 
@@ -208,10 +215,7 @@ static void dhcp_offer_prepare(struct dhcp_raw_packet *raw, uint8_t *src_mac,
 	packet->op = BOOTREPLY;
 	packet->htype = 1;
 	packet->hlen = 6;
-	if (dst_ip) {
-		packet->yiaddr = dst_ip;
-		packet->siaddr_nip = src_ip;
-	}
+	packet->siaddr_nip = src_ip;
 	packet->cookie = htonl(DHCP_MAGIC);
 	memcpy(packet->chaddr, dst_mac, 6);
 	packet->options[0] = DHCP_END;
@@ -312,6 +316,19 @@ static struct dhcp_packet *get_dhcp_packet(uint8_t *buf, int buflen, uint8_t *ma
 	return dhcp;
 }
 
+static void dhcp_options_add_u8(uint8_t **popt, uint8_t code, uint8_t data)
+{
+	uint8_t *opt = *popt;
+
+	opt[OPT_CODE] = code;
+	opt[OPT_LEN] = 1;
+	opt[OPT_DATA] = data;
+	opt += 3;
+
+	*popt = opt;
+	opt[OPT_CODE] = DHCP_END;
+}
+
 static void dhcp_options_add_u32(uint8_t **popt, uint8_t code, uint32_t data)
 {
 	uint8_t *opt = *popt;
@@ -323,43 +340,6 @@ static void dhcp_options_add_u32(uint8_t **popt, uint8_t code, uint32_t data)
 
 	*popt = opt;
 	opt[OPT_CODE] = DHCP_END;
-}
-
-static int process_am335x_dhcp(struct dhcp_packet *packet,
-			       struct dhcp_raw_packet *ack, const char *bootfile)
-{
-	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
-	uint8_t *opt;
-
-#if 0
-	/* "vender-class-identifier" option number 60 (RFC 1497, RFC 1533).
-	 * Servers could use this information to identify the device type.
-	 * The value present is "AM335x ROM".
-	 */
-	opt = udhcp_get_option(packet, 60);
-	if (!opt || strncmp((char *)opt, "AM335x ROM", 10))
-		return -1;
-
-	/* "Client-identifier" option number 61 (RFC 1497, RFC 1533).
-	 * This has the ASIC-ID structure which contains additional
-	 * info for the device.
-	 */
-	opt = udhcp_get_option(packet, 61);
-	if (!opt)
-		return -1;
-#endif
-
-	ack_dhcp->xid = packet->xid;
-	if (bootfile)
-		strncpy(ack_dhcp->file, bootfile, sizeof(ack_dhcp->file));
-
-	opt = ack_dhcp->options;
-	dhcp_options_add_u32(&opt,  3, ack->ip_hdr.saddr); /* Router */
-	dhcp_options_add_u32(&opt, 51, htonl(600)); /* IP Address Lease Time */
-	dhcp_options_add_u32(&opt,  1, htonl(0xffffff00)); /* Subnet mask */
-	dhcp_options_add_u32(&opt, 54, ack->ip_hdr.saddr); /* DHCP Server */
-
-	return 0;
 }
 
 int dhcp_sock(int ifindex)
@@ -417,22 +397,172 @@ static struct dhcp_packet *get_dhcp_packet_from_socket(int sock, uint8_t *mac,
 	return get_dhcp_packet(buf, ret, mac);
 }
 
+static int process_am335x_dhcp(struct dhcp_packet *packet,
+			       struct dhcp_raw_packet *ack,
+			       struct netboot_device *dev)
+{
+	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
+	uint8_t *opt;
+
+	/* "vender-class-identifier" option number 60 (RFC 1497, RFC 1533).
+	 * Servers could use this information to identify the device type.
+	 * The value present is "AM335x ROM".
+	 */
+	opt = udhcp_get_option(packet, 60);
+	if (!opt || strncmp((char *)opt, "AM335x ROM", 10))
+		return -1;
+
+	/* "Client-identifier" option number 61 (RFC 1497, RFC 1533).
+	 * This has the ASIC-ID structure which contains additional
+	 * info for the device.
+	 */
+	opt = udhcp_get_option(packet, 61);
+	if (!opt)
+		return -1;
+
+	netboot_device_generate_client_ip(dev);
+	ack_dhcp->yiaddr = dev->ip_client.s_addr;
+
+	ack_dhcp->xid = packet->xid;
+	if (dev->bootfile)
+		strncpy(ack_dhcp->file, dev->bootfile, sizeof(ack_dhcp->file));
+
+	opt = ack_dhcp->options;
+	dhcp_options_add_u32(&opt,  3, dev->ip_server.s_addr); /* Router */
+	dhcp_options_add_u32(&opt, 51, htonl(600)); /* IP Address Lease Time */
+	dhcp_options_add_u32(&opt,  1, htonl(0xffffff00)); /* Subnet mask */
+	dhcp_options_add_u32(&opt, 54, dev->ip_server.s_addr); /* DHCP Server */
+
+	printf("AM335x %02x:%02x:%02x:%02x:%02x:%02x take ip %s\n",
+		dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3],
+		dev->mac[4], dev->mac[5], inet_ntoa(dev->ip_client));
+
+	return 0;
+}
+
+static int process_dhcp_discover(struct dhcp_packet *packet,
+				 struct dhcp_raw_packet *ack,
+				 struct netboot_device *dev)
+{
+	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
+	uint8_t *opt;
+
+	netboot_device_generate_client_ip(dev);
+
+	ack_dhcp->op = BOOTREPLY;
+	ack_dhcp->xid = packet->xid;
+	ack_dhcp->yiaddr = dev->ip_client.s_addr;
+
+	if (dev->bootfile)
+		strncpy(ack_dhcp->file, dev->bootfile, sizeof(ack_dhcp->file));
+
+	opt = ack_dhcp->options;
+	dhcp_options_add_u8(&opt, DHCP_MESSAGE_TYPE, DHCP_OFFER);
+	dhcp_options_add_u32(&opt, 54, dev->ip_server.s_addr); /* DHCP Server */
+	dhcp_options_add_u32(&opt, 51, htonl(600)); /* IP Address Lease Time */
+	dhcp_options_add_u32(&opt,  1, htonl(0xffffff00)); /* Subnet mask */
+	dhcp_options_add_u32(&opt,  3, dev->ip_server.s_addr); /* Router */
+
+	return 0;
+}
+
+static int process_dhcp_request(struct dhcp_packet *packet,
+				struct dhcp_raw_packet *ack,
+				struct netboot_device *dev)
+{
+	struct dhcp_packet *ack_dhcp = &ack->dhcp_packet;
+	uint8_t *opt;
+
+	opt = udhcp_get_option(packet, 54); /* DHCP Server */
+	if (!opt || memcmp(opt, &dev->ip_server.s_addr, 4))
+		return -1;
+
+	opt = udhcp_get_option(packet, 50); /* IP Address */
+	if (!opt || memcmp(opt, &dev->ip_client.s_addr, 4))
+		return -1;
+
+	ack_dhcp->op = BOOTREPLY;
+	ack_dhcp->xid = packet->xid;
+	ack_dhcp->yiaddr = dev->ip_client.s_addr;
+
+	if (dev->bootfile)
+		strncpy(ack_dhcp->file, dev->bootfile, sizeof(ack_dhcp->file));
+
+	opt = ack_dhcp->options;
+	dhcp_options_add_u8(&opt, DHCP_MESSAGE_TYPE, DHCP_ACK);
+	dhcp_options_add_u32(&opt, 54, dev->ip_server.s_addr); /* DHCP Server */
+	dhcp_options_add_u32(&opt, 51, htonl(600)); /* IP Address Lease Time */
+	dhcp_options_add_u32(&opt,  1, htonl(0xffffff00)); /* Subnet mask */
+	dhcp_options_add_u32(&opt,  3, dev->ip_server.s_addr); /* Router */
+
+	printf("New device %s offer ip %s\n",
+		dev->dhcp_vci[0] != '\0' ? dev->dhcp_vci : "???",
+		inet_ntoa(dev->ip_client));
+
+	return 0;
+}
+
+/*
+ * 20  0.0.0.0      68  255.255.255.255  67  DHCP  DHCP Discover - ID 0xbeef4ae7
+ * 27  192.168.0.1  67  255.255.255.255  68  DHCP  DHCP Offer    - ID 0xbeef4ae7
+ * 28  0.0.0.0      68  255.255.255.255  67  DHCP  DHCP Request  - ID 0xbeef4ae7
+ * 31  192.168.0.1  67  255.255.255.255  68  DHCP  DHCP ACK      - ID 0xbeef4ae7
+ */
+static int process_dhcp_default(struct dhcp_packet *packet,
+				struct dhcp_raw_packet *ack,
+				struct netboot_device *dev)
+{
+	uint8_t *opt;
+
+	/* copy Vendor class identifier to netboot_device */
+	memset(dev->dhcp_vci, 0, sizeof(dev->dhcp_vci));
+	opt = udhcp_get_option(packet, 60);
+	if (opt) {
+		int sz = opt[-1]; /* OPT_LEN */
+
+		if (sz >= (int)sizeof(dev->dhcp_vci) - 1)
+			sz = sizeof(dev->dhcp_vci) - 1;
+		memcpy(dev->dhcp_vci, opt, sz);
+	}
+
+	opt = udhcp_get_option(packet, DHCP_MESSAGE_TYPE);
+	if (!opt)
+		return -1;
+
+	switch (*opt) {
+	case DHCP_DISCOVER:
+		return process_dhcp_discover(packet, ack, dev);
+	case DHCP_REQUEST:
+		return process_dhcp_request(packet, ack, dev);
+	}
+
+	return -1;
+}
+
+static int process_dhcp_packet(struct dhcp_packet *packet,
+			       struct dhcp_raw_packet *ack,
+			       struct netboot_device *dev)
+{
+	if (process_am335x_dhcp(packet, ack, dev) == 0)
+		return 0;
+
+	return process_dhcp_default(packet, ack, dev);
+}
+
 static void handle_dhcp_packet(int sock, struct dhcp_packet *packet,
-			       uint8_t *mac, uint8_t *dmac,
-			       struct in_addr *s,
-			       struct in_addr *c,
-			       const char *bootfile)
+			       uint8_t *device_mac,
+			       struct netboot_device *dev)
 {
 	struct dhcp_raw_packet ack;
+	int ret;
 
-	dhcp_offer_prepare(&ack, mac, dmac, s->s_addr, c->s_addr);
+	if (!packet || packet->op != BOOTREQUEST)
+		return;
 
-	if (packet && !process_am335x_dhcp(packet, &ack, bootfile)) {
+	dhcp_offer_prepare(&ack, dev->mac, device_mac, dev->ip_server.s_addr);
+
+	if (process_dhcp_packet(packet, &ack, dev) == 0) {
 		int len = dhcp_offer_finish(&ack);
-
-		printf("AM335x %02x:%02x:%02x:%02x:%02x:%02x take ip %s\n",
-			dmac[0], dmac[1], dmac[2], dmac[3],
-			dmac[4], dmac[5], inet_ntoa(*c));
 
 		if (sendto(sock, &ack, len, 0, NULL, 0) <= 0) {
 			fprintf(stderr, "sendto() failed: %s\n",
@@ -448,10 +578,7 @@ int process_dhcp(int sock, struct netboot_device *dev)
 
 	handle_dhcp_packet(sock,
 			   get_dhcp_packet_from_socket(sock, device_macaddr, &netdown),
-			   dev->mac, device_macaddr,
-			   &dev->ip_server,
-			   &dev->ip_client,
-			   dev->bootfile);
+			   device_macaddr, dev);
 
 	return netdown;
 }

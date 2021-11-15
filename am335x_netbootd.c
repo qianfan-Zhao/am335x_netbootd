@@ -55,11 +55,11 @@ static struct tftp_conn conn[MAX_TFTP_CONN];
 
 static struct in_addr client_ip = { 0 };
 
-static void get_next_client_ip(struct in_addr *client)
+void netboot_device_generate_client_ip(struct netboot_device *dev)
 {
 	uint32_t n, c = ntohl(client_ip.s_addr);
 
-	*client = client_ip;
+	dev->ip_client = client_ip;
 
 	/* generate the next client ip in range [2, 200] */
 	n = (c & 0xff) + 1;
@@ -279,7 +279,6 @@ static int network_work(struct netboot_device *dev)
 		}
 
 		if (FD_ISSET(sock_dhcp, &rfds)) {
-			get_next_client_ip(&dev->ip_client);
 			if (process_dhcp(sock_dhcp, dev))
 				break;
 		}
