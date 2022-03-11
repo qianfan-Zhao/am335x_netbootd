@@ -123,7 +123,7 @@ static int get_ifhwaddr(char *ifname, unsigned char *mac)
 	return 0;
 }
 
-static int get_set_ifaddr(char *ifname, struct in_addr *ipv4)
+static int set_ifaddr(char *ifname, struct in_addr *ipv4)
 {
 	struct sockaddr_in sai;
 	struct ifreq ifr;
@@ -144,56 +144,38 @@ static int get_set_ifaddr(char *ifname, struct in_addr *ipv4)
 		return -1;
 	}
 
-	if (-1 == ioctl(sock, SIOCGIFADDR, &ifr)) {
-		/* the network interface doesn't has an ip address */
-		if (!ipv4->s_addr) {
-			/* the topper level doesn't set ip address */
-			fprintf(stderr, "network %s doesn't has an ip address\n"
-					"you can use -c option set one\n",
-					ifname);
-			close(sock);
-			return -1;
-		}
 
-		/* set ip address and up interface */
-		memset(&sai, 0, sizeof(sai));
-		sai.sin_family = AF_INET;
-		sai.sin_port = 0;
-		sai.sin_addr.s_addr = ipv4->s_addr;
-		memcpy((char *)&ifr + offsetof(struct ifreq, ifr_addr), &sai,
-			sizeof(struct sockaddr));
+	if (!ipv4->s_addr) {
+		/* the topper level doesn't set ip address */
+		fprintf(stderr, "network %s doesn't has an ip address\n"
+				"you can use -c option set one\n",
+				ifname);
+		close(sock);
+		return -1;
+	}
 
-		if (-1 == ioctl(sock, SIOCSIFADDR, &ifr)) {
-			fprintf(stderr, "ioctl() SIFADDR for %s failed: %s\n",
-					ifname, strerror(errno));
-			close(sock);
-			return -1;
-		}
+	/* set ip address and up interface */
+	memset(&sai, 0, sizeof(sai));
+	sai.sin_family = AF_INET;
+	sai.sin_port = 0;
+	sai.sin_addr.s_addr = ipv4->s_addr;
+	memcpy((char *)&ifr + offsetof(struct ifreq, ifr_addr), &sai,
+		sizeof(struct sockaddr));
 
-		ioctl(sock, SIOCGIFFLAGS, &ifr);
-		ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-		if (-1 == ioctl(sock, SIOCSIFFLAGS, &ifr)) {
-			fprintf(stderr, "ioctl() SIFFLAGS for %s failed: %s\n",
-					ifname, strerror(errno));
-			close(sock);
-			return -1;
-		}
-	} else {
-		struct in_addr ip;
+	if (-1 == ioctl(sock, SIOCSIFADDR, &ifr)) {
+		fprintf(stderr, "ioctl() SIFADDR for %s failed: %s\n",
+				ifname, strerror(errno));
+		close(sock);
+		return -1;
+	}
 
-		ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
-		if ((ntohl(ip.s_addr) ^ ntohl(ipv4->s_addr)) & 0xffffff00) {
-			/* inet_ntoa is not thread safe, split the message */
-			fprintf(stderr, "-c %s and the ip addr of ",
-					inet_ntoa(*ipv4));
-			fprintf(stderr, "%s (%s) not in a subgroup\n",
-					ifname, inet_ntoa(ip));
-			close(sock);
-			return -1;
-		}
-
-		/* replace ipv4 with the real address */
-		*ipv4 = ip;
+	ioctl(sock, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+	if (-1 == ioctl(sock, SIOCSIFFLAGS, &ifr)) {
+		fprintf(stderr, "ioctl() SIFFLAGS for %s failed: %s\n",
+				ifname, strerror(errno));
+		close(sock);
+		return -1;
 	}
 
 	close(sock);
@@ -203,18 +185,18 @@ static int get_set_ifaddr(char *ifname, struct in_addr *ipv4)
 static int if_param(char *ifname, int *ifindex, uint8_t *mac,
 		    struct in_addr *server_ip)
 {
+	int ret = -1;
+
 	if ((*ifindex = if_nametoindex(ifname)) == 0) {
 		fprintf(stderr, "get ifindex failed: %s\n", strerror(errno));
 		return -1;
 	}
 
-	if (-1 == get_ifhwaddr(ifname, mac))
-		return -1;
+	ret = get_ifhwaddr(ifname, mac);
+	if (!ret)
+		ret = set_ifaddr(ifname, server_ip);
 
-	if (-1 == get_set_ifaddr(ifname, server_ip))
-		return -1;
-
-	return 0;
+	return ret;
 }
 
 static int network_work(struct netboot_device *dev)
