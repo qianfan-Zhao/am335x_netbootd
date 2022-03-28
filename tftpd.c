@@ -221,8 +221,10 @@ int tftp_init(uint32_t ip, struct tftp_conn *conn, int num)
 
 	for (i = 0; i < num; i++) {
 		memset(conn + i, 0, sizeof(struct tftp_conn));
+		conn[i].quirks = 0;
 		conn[i].sock = -1;
 		conn[i].fd = -1;
+		conn[i].filesize = -1;
 		conn[i].remain_char = TFTP_REMAIN_CHAR_INVALID;
 	}
 
@@ -255,12 +257,23 @@ void tftp_conn_release(struct tftp_conn *conn)
 
 void tftp_do(struct tftp_conn *conn)
 {
-	char res_buf[600];
+	char res_buf[600], *p = res_buf;
 	int res_len = 0;
 	struct sockaddr_in addr;
 	int ret;
 	char *tosent;
 	int cloing = 0;
+
+#define res_add_htons(n)				do {	\
+	*(uint16_t *)p = htons((n));				\
+	p += sizeof(uint16_t);					\
+} while (0)
+
+#define res_add_string(s)				do {	\
+	int len = strlen((s)) + 1; /* includeing null */	\
+	memcpy(p, (s), len);					\
+	p += len;						\
+} while (0)
 
 	switch (conn->opcode) {
 		/* reply error */
@@ -277,7 +290,27 @@ void tftp_do(struct tftp_conn *conn)
 	case TFTP_OP_RRQ:
 		conn->block = 0;
 		conn->data = 0;
-		/* fall through */
+
+		if ((conn->quirks & TFTP_QUIRKS_NO_OACK) == 0) {
+			/* option acknowledgement with tsize
+			 *
+			 * Opcode: Option Acknowledgement (6)
+			 * option name: tsize
+			 * option value: filesize (in string mode)
+			 */
+			res_add_htons(TFTP_OP_OACK);
+			res_add_string("tsize");
+			{
+				char size[32];
+				snprintf(size, sizeof(size), "%d", conn->filesize);
+				res_add_string(size);
+			}
+
+			res_len = p - res_buf;
+			break;
+		}
+
+		/* fall through, sending the first data block */
 	case TFTP_OP_ACK:
 		if (conn->data == conn->block) {
 			if (conn->opcode == TFTP_OP_ACK &&
@@ -431,6 +464,7 @@ int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 	int i;
 	int sock_conn;
 	int fd;
+	int offset, filesize;
 
 	ret = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&addr,
 		       &addrlen);
@@ -498,6 +532,7 @@ int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 	else
 		fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0664);
 
+	conn[i].quirks = 0;
 	conn[i].client_ip = addr.sin_addr.s_addr;
 	conn[i].client_port = addr.sin_port;
 	conn[i].sock = sock_conn;
@@ -516,8 +551,18 @@ int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 		conn[i].opcode = type;
 	}
 
-	if (!strcmp(name, "MLO"))
+	if (!strcmp(name, "MLO")) {
 		am335x_mlo_skip_toc(fd);
+
+		/* AM335X's IBR can't process OACK */
+		conn[i].quirks |= TFTP_QUIRKS_NO_OACK;
+	}
+
+	/* Save filesize to conn->filesize and return with OACK.tsize */
+	offset = lseek(fd, 0, SEEK_CUR);
+	filesize = lseek(fd, 0, SEEK_END) - offset;
+	lseek(fd, offset, SEEK_SET);
+	conn[i].filesize = filesize;
 
 	tftp_do(&conn[i]);
 	return 0;

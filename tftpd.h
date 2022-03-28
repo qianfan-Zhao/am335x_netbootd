@@ -14,6 +14,7 @@
 #define TFTP_OP_DATA 3
 #define TFTP_OP_ACK 4
 #define TFTP_OP_ERR 5
+#define TFTP_OP_OACK 6
 
 #define TFTP_OP_DO_ACK 10
 #define TFTP_OP_DO_DATA 11
@@ -29,7 +30,11 @@ enum TFTP_STATE {
 	TFTP_STATE_CLOSING,
 };
 
+#define TFTP_QUIRKS_NO_OACK		(1 << 0)
+
 struct tftp_conn {
+	unsigned int quirks;
+
 	int type;
 	int convert; /* 0: octet, 1 netascii */
 	int sock;
@@ -37,6 +42,7 @@ struct tftp_conn {
 	uint16_t client_port;
 	uint16_t block;
 	int fd;
+	int filesize;
 
 	int state;
 	int opcode;
