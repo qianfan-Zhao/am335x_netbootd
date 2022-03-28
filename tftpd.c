@@ -279,10 +279,16 @@ void tftp_do(struct tftp_conn *conn)
 		/* reply error */
 	case TFTP_OP_DO_ERR:
 		conn->state = TFTP_STATE_ERROR;
-		*(unsigned short *)res_buf = htons(TFTP_OP_ERR);
-		*(unsigned short *)(res_buf + 2) = htons(0);
-		memcpy(res_buf + 4, conn->buf, conn->buflen);
-		res_len = 4 + conn->buflen;
+
+		/* Opcode: Error Code(5)
+		 * Error code: File not found (1)
+		 * Error message: open failed: No such file or directory
+		 */
+		res_add_htons(TFTP_OP_ERR);
+		res_add_htons(TFTP_ERR_FILE_NOT_FOUND);
+		res_add_string(conn->buf);
+		res_len = p - res_buf;
+
 		printf("tftp error %s\n", conn->buf);
 		break;
 
@@ -549,20 +555,20 @@ int process_tftp_req(int sock, uint32_t srvip, struct tftp_conn *conn, int num)
 			1 + sprintf(buf, "open failed: %s", strerror(errno));
 	} else {
 		conn[i].opcode = type;
+
+		if (!strcmp(name, "MLO")) {
+			am335x_mlo_skip_toc(fd);
+
+			/* AM335X's IBR can't process OACK */
+			conn[i].quirks |= TFTP_QUIRKS_NO_OACK;
+		}
+
+		/* Save filesize to conn->filesize and return with OACK.tsize */
+		offset = lseek(fd, 0, SEEK_CUR);
+		filesize = lseek(fd, 0, SEEK_END) - offset;
+		lseek(fd, offset, SEEK_SET);
+		conn[i].filesize = filesize;
 	}
-
-	if (!strcmp(name, "MLO")) {
-		am335x_mlo_skip_toc(fd);
-
-		/* AM335X's IBR can't process OACK */
-		conn[i].quirks |= TFTP_QUIRKS_NO_OACK;
-	}
-
-	/* Save filesize to conn->filesize and return with OACK.tsize */
-	offset = lseek(fd, 0, SEEK_CUR);
-	filesize = lseek(fd, 0, SEEK_END) - offset;
-	lseek(fd, offset, SEEK_SET);
-	conn[i].filesize = filesize;
 
 	tftp_do(&conn[i]);
 	return 0;
